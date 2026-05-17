@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch import nn
 
 from model.dit.blocks import (
     SelfAttention, CrossAttention, Mlp, DiTBlock, FinalLayer,
@@ -130,3 +131,37 @@ def test_rope3d_configure_required_before_apply():
     q = torch.randn(1, 1, 4, 12)
     with pytest.raises(RuntimeError, match="configure"):
         rope.apply(q, q)
+
+
+# -- Conv3d(1, p, p) <-> Conv2d(p, p) numerical parity at T=1 ---------------
+
+
+def test_conv3d_patch_embed_matches_conv2d_at_t1():
+    """`LyapunovDiT.x_embedder` is `Conv3d(C, D, (1,p,p), (1,p,p))` so the same
+    forward path serves T=1 images and T>1 video.  At T=1 the result must
+    bit-equal a plain `Conv2d(C, D, p, p)` initialized with the same weights;
+    otherwise initializing from a PixArt (Conv2d) checkpoint would introduce a
+    silent numerical shift in every token.
+
+    CPU only -- cuDNN may pick a different algorithm per shape and we want a
+    deterministic equality check.
+    """
+    torch.manual_seed(0)
+    C, D, p = 4, 32, 2
+    H, W = 8, 8
+    B = 2
+
+    conv2d = nn.Conv2d(C, D, kernel_size=p, stride=p, bias=True)
+    conv3d = nn.Conv3d(C, D, kernel_size=(1, p, p), stride=(1, p, p), bias=True)
+
+    # Copy 2D weights into the 3D conv's (T_p=1) slice.
+    with torch.no_grad():
+        conv3d.weight.copy_(conv2d.weight.unsqueeze(2))
+        conv3d.bias.copy_(conv2d.bias)
+
+    x2d = torch.randn(B, C, H, W)
+    x3d = x2d.unsqueeze(2)                          # [B, C, 1, H, W]
+
+    out2d = conv2d(x2d)                             # [B, D, H/p, W/p]
+    out3d = conv3d(x3d).squeeze(2)                  # [B, D, H/p, W/p]
+    assert torch.equal(out2d, out3d), "Conv3d(1,p,p) at T=1 must bit-equal Conv2d(p,p)"

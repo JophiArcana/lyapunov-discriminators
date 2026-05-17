@@ -22,7 +22,6 @@ def _tiny_cfg(**overrides) -> LyapunovDiTConfig:
         text_dim=16,
         text_max_len=5,
         compute_dtype="float32",
-        cls_head_hidden=16,
     )
     base.update(overrides)
     return LyapunovDiTConfig(**base)
@@ -34,18 +33,16 @@ def test_backbone_shape_image_with_text():
     x = torch.randn(2, 4, 1, 8, 8)                                  # [B, C, T=1, H, W]
     text = torch.randn(2, 5, 16)
     mask = torch.ones(2, 5, dtype=torch.bool)
-    x0_hat, cls = model(x, text, mask)
+    x0_hat = model(x, text, mask)
     assert x0_hat.shape == (2, 4, 1, 8, 8)
-    assert cls is not None and cls.shape == (2,)
 
 
 def test_backbone_shape_unconditional():
     cfg = _tiny_cfg(text_encoder="none", cross_attn_per_block=False)
     model = LyapunovDiT(cfg)
     x = torch.randn(2, 4, 1, 8, 8)
-    x0_hat, cls = model(x, None, None)
+    x0_hat = model(x, None, None)
     assert x0_hat.shape == x.shape
-    assert cls is not None
 
 
 def test_backbone_modulation_kinds_shape_invariant():
@@ -55,7 +52,7 @@ def test_backbone_modulation_kinds_shape_invariant():
         x = torch.randn(1, 4, 1, 4, 4)
         text = torch.randn(1, 5, 16)
         mask = torch.ones(1, 5, dtype=torch.bool)
-        x0_hat, _ = model(x, text, mask)
+        x0_hat = model(x, text, mask)
         assert x0_hat.shape == x.shape
 
 
@@ -67,7 +64,7 @@ def test_backbone_pos_embed_kinds_shape_invariant():
         x = torch.randn(1, 4, 2, 4, 4)              # T=2
         text = torch.randn(1, 5, 16)
         mask = torch.ones(1, 5, dtype=torch.bool)
-        x0_hat, _ = model(x, text, mask)
+        x0_hat = model(x, text, mask)
         assert x0_hat.shape == x.shape
 
 
@@ -80,14 +77,8 @@ def test_backbone_out_multiplier_2_only_returns_first_half():
     x = torch.randn(1, 4, 1, 4, 4)
     text = torch.randn(1, 5, 16)
     mask = torch.ones(1, 5, dtype=torch.bool)
-    x0_hat, _ = model(x, text, mask)
+    x0_hat = model(x, text, mask)
     assert x0_hat.shape == x.shape
-
-
-def test_backbone_cls_token_pool_disallowed_with_rope():
-    cfg = _tiny_cfg(pos_embed="rope_3d", cls_pool="cls_token", max_t_tokens=2)
-    with pytest.raises(ValueError, match="cls_pool='cls_token'"):
-        LyapunovDiT(cfg)
 
 
 def test_backbone_gradients_flow():
@@ -96,10 +87,9 @@ def test_backbone_gradients_flow():
     x = torch.randn(2, 4, 1, 4, 4, requires_grad=False)
     text = torch.randn(2, 5, 16)
     mask = torch.ones(2, 5, dtype=torch.bool)
-    x0_hat, cls = model(x, text, mask)
-    loss = (x0_hat - x).pow(2).mean() + cls.pow(2).mean()
+    x0_hat = model(x, text, mask)
+    loss = (x0_hat - x).pow(2).mean()
     loss.backward()
-    # At least one parameter has a non-None grad.
     grad_norms = [
         (n, p.grad.norm().item()) for n, p in model.named_parameters() if p.grad is not None
     ]

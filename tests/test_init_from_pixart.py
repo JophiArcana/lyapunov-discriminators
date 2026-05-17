@@ -14,7 +14,10 @@ import torch
 
 from model.dit.backbone import LyapunovDiT
 from model.dit.config import LyapunovDiTConfig
-from model.dit.init_from import init_from_pixart_sigma
+from model.dit.init_from import (
+    init_from_pixart_sigma,
+    init_from_pixart_sigma_diffusers,
+)
 
 
 def _pixart_like_state_dict(D: int = 1152, depth: int = 28, C: int = 4, p: int = 2,
@@ -90,12 +93,6 @@ def test_pixart_init_out_multiplier_2_copies_bit_exactly(small_pixart_cfg):
     assert torch.equal(model.final_layer.linear.weight, sd["final_layer.linear.weight"])
     # `info` reports the load.
     assert any("blocks.1.mlp.fc2.weight" in k for k in info["loaded_keys"])
-    # Missing keys are *expected* -- our LyapunovDiT adds f_head + learnable_t
-    # which PixArt-Sigma simply doesn't have.  (`cls_token` only exists when
-    # cls_pool='cls_token', which the default config does not use.)
-    expected_missing = {"f_head.fc1.weight", "learnable_t"}
-    for k in expected_missing:
-        assert any(k in m for m in info["missing"]), f"expected {k} to be in missing keys"
 
 
 def test_pixart_init_out_multiplier_1_keeps_only_mean_channels(small_pixart_cfg):
@@ -123,3 +120,94 @@ def test_pixart_init_rejects_mismatched_geometry():
     sd = _pixart_like_state_dict(D=512, depth=2, C=4, p=2, text_dim=4096)
     with pytest.raises(ValueError, match="differ from PixArt-Sigma"):
         init_from_pixart_sigma(model, sd)
+
+
+# -----------------------------------------------------------------------------
+# diffusers-format adapter
+# -----------------------------------------------------------------------------
+
+
+def _diffusers_pixart_state_dict(
+        D: int = 1152, depth: int = 28, C: int = 4, p: int = 2, text_dim: int = 4096,
+) -> dict:
+    """State dict mirroring the diffusers `PixArtTransformer2DModel` key layout.
+
+    Q/K/V are stored as separate `to_q` / `to_k` / `to_v` linears (not fused);
+    K/V on cross-attention are also separate.  This synthesizes the exact key
+    set that `safetensors.load_file` would return from the Hub checkpoint.
+    """
+    sd: dict[str, torch.Tensor] = {}
+
+    sd["pos_embed.proj.weight"] = torch.randn(D, C, p, p)
+    sd["pos_embed.proj.bias"]   = torch.randn(D)
+
+    sd["adaln_single.emb.timestep_embedder.linear_1.weight"] = torch.randn(D, 256)
+    sd["adaln_single.emb.timestep_embedder.linear_1.bias"]   = torch.randn(D)
+    sd["adaln_single.emb.timestep_embedder.linear_2.weight"] = torch.randn(D, D)
+    sd["adaln_single.emb.timestep_embedder.linear_2.bias"]   = torch.randn(D)
+    sd["adaln_single.linear.weight"] = torch.randn(6 * D, D)
+    sd["adaln_single.linear.bias"]   = torch.randn(6 * D)
+
+    sd["caption_projection.linear_1.weight"] = torch.randn(D, text_dim)
+    sd["caption_projection.linear_1.bias"]   = torch.randn(D)
+    sd["caption_projection.linear_2.weight"] = torch.randn(D, D)
+    sd["caption_projection.linear_2.bias"]   = torch.randn(D)
+
+    for i in range(depth):
+        sd[f"transformer_blocks.{i}.scale_shift_table"] = torch.randn(6, D)
+        for which in ("to_q", "to_k", "to_v"):
+            sd[f"transformer_blocks.{i}.attn1.{which}.weight"] = torch.randn(D, D)
+            sd[f"transformer_blocks.{i}.attn1.{which}.bias"]   = torch.randn(D)
+        sd[f"transformer_blocks.{i}.attn1.to_out.0.weight"]    = torch.randn(D, D)
+        sd[f"transformer_blocks.{i}.attn1.to_out.0.bias"]      = torch.randn(D)
+        for which in ("to_q", "to_k", "to_v"):
+            sd[f"transformer_blocks.{i}.attn2.{which}.weight"] = torch.randn(D, D)
+            sd[f"transformer_blocks.{i}.attn2.{which}.bias"]   = torch.randn(D)
+        sd[f"transformer_blocks.{i}.attn2.to_out.0.weight"]    = torch.randn(D, D)
+        sd[f"transformer_blocks.{i}.attn2.to_out.0.bias"]      = torch.randn(D)
+        sd[f"transformer_blocks.{i}.ff.net.0.proj.weight"]     = torch.randn(4 * D, D)
+        sd[f"transformer_blocks.{i}.ff.net.0.proj.bias"]       = torch.randn(4 * D)
+        sd[f"transformer_blocks.{i}.ff.net.2.weight"]          = torch.randn(D, 4 * D)
+        sd[f"transformer_blocks.{i}.ff.net.2.bias"]            = torch.randn(D)
+
+    sd["scale_shift_table"] = torch.randn(2, D)
+    sd["proj_out.weight"]   = torch.randn(p * p * 2 * C, D)
+    sd["proj_out.bias"]     = torch.randn(p * p * 2 * C)
+
+    return sd
+
+
+def test_pixart_diffusers_init_fuses_qkv_correctly(small_pixart_cfg):
+    cfg = small_pixart_cfg
+    model = LyapunovDiT(cfg)
+    sd = _diffusers_pixart_state_dict(D=cfg.hidden_size, depth=cfg.depth,
+                                      C=cfg.latent_channels, p=cfg.patch_size[1],
+                                      text_dim=cfg.text_dim)
+    init_from_pixart_sigma_diffusers(model, sd, strict_shapes=True)
+
+    # patch embed: 2D -> 3D via unsqueeze on dim 2.
+    assert torch.equal(model.x_embedder.weight,
+                       sd["pos_embed.proj.weight"].unsqueeze(2))
+
+    # self-attn qkv: stacked along output dim in [q, k, v] order.
+    expected_qkv = torch.cat([
+        sd["transformer_blocks.0.attn1.to_q.weight"],
+        sd["transformer_blocks.0.attn1.to_k.weight"],
+        sd["transformer_blocks.0.attn1.to_v.weight"],
+    ], dim=0)
+    assert torch.equal(model.blocks[0].attn.qkv.weight, expected_qkv)
+
+    # cross-attn kv: stacked along output dim in [k, v] order (q is separate).
+    expected_kv = torch.cat([
+        sd["transformer_blocks.0.attn2.to_k.weight"],
+        sd["transformer_blocks.0.attn2.to_v.weight"],
+    ], dim=0)
+    assert torch.equal(model.blocks[0].cross_attn.kv_linear.weight, expected_kv)
+    assert torch.equal(model.blocks[0].cross_attn.q_linear.weight,
+                       sd["transformer_blocks.0.attn2.to_q.weight"])
+
+    # adaln_single.linear -> t_block.1
+    assert torch.equal(model.t_block[1].weight, sd["adaln_single.linear.weight"])
+
+    # final_layer.linear (out_multiplier=2 -> full copy).
+    assert torch.equal(model.final_layer.linear.weight, sd["proj_out.weight"])

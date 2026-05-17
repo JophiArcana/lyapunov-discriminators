@@ -22,7 +22,6 @@ def _tiny_cfg(**overrides) -> LyapunovDiTConfig:
         text_dim=16,
         text_max_len=5,
         compute_dtype="float32",
-        cls_head_hidden=16,
     )
     base.update(overrides)
     return LyapunovDiTConfig(**base)

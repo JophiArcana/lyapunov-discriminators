@@ -28,7 +28,6 @@ def _tiny_cfg(**overrides) -> LyapunovDiTConfig:
         text_dim=16,
         text_max_len=5,
         compute_dtype="float32",
-        cls_head_hidden=16,
     )
     base.update(overrides)
     return LyapunovDiTConfig(**base)
@@ -61,11 +60,11 @@ class TextDependentT(torch.nn.Module):
 
     def forward(self, x, text_kv, text_mask):
         if text_kv is None:
-            return x, None
+            return x
         # Treat null_kv (all zeros) as identity even when not None.
         text_sum = text_kv.sum(dim=(1, 2)).view(-1, 1, 1, 1, 1)
         a = self.scale * text_sum
-        return x + a * x, None
+        return x + a * x
 
 
 # -- cfg_scale=0: short-circuits to plain conditional, both modes identical ---
@@ -93,12 +92,11 @@ def test_cfg_scale_zero_score_and_x0_modes_are_bit_equal():
 # -- cfg_scale=1: both reduce algebraically to plain conditional sampling -----
 
 
-def test_cfg_scale_one_score_and_x0_modes_agree_when_no_cls():
+def test_cfg_scale_one_score_and_x0_modes_agree():
     """At `cfg_scale=1`:
       * score-CFG: `S_g = S_uncond + 1 * (S_cond - S_uncond) = S_cond`.
       * x0-CFG:    `T_g = T_uncond + 1 * (T_cond - T_uncond) = T_cond`,
-                   so the energy `||T_g - x||^2 = ||T_cond - x||^2 = S_cond`
-                   (matching when `include_cls=False`).
+                   so the energy `||T_g - x||^2 = ||T_cond - x||^2 = S_cond`.
     Both should produce identical trajectories.  We allow a tiny floating-point
     tolerance because the two paths take different forward orderings even
     though they're algebraically equivalent.
@@ -108,8 +106,7 @@ def test_cfg_scale_one_score_and_x0_modes_agree_when_no_cls():
 
     common = dict(
         n_steps=2, lr=1e-2, dynamics="gd",
-        cfg_scale=1.0, null_kv=null_kv, null_mask=null_mask,
-        include_cls=False, lambda_cls=0.0, seed=11,
+        cfg_scale=1.0, null_kv=null_kv, null_mask=null_mask, seed=11,
     )
     out_score = sample(model, x.clone(), text, mask, cfg_mode="score", **common)
     out_x0    = sample(model, x.clone(), text, mask, cfg_mode="x0",    **common)
@@ -129,8 +126,7 @@ def test_cfg_overshoot_yields_different_trajectories_per_mode():
 
     common = dict(
         n_steps=1, lr=1e-1, dynamics="gd",
-        cfg_scale=2.0, null_kv=null_kv, null_mask=null_mask,
-        include_cls=False, lambda_cls=0.0, seed=0,
+        cfg_scale=2.0, null_kv=null_kv, null_mask=null_mask, seed=0,
     )
     out_score = sample(model, x.clone(), text, mask, cfg_mode="score", **common)
     out_x0    = sample(model, x.clone(), text, mask, cfg_mode="x0",    **common)

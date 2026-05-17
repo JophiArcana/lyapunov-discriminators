@@ -11,10 +11,10 @@ used in two opposite-intent settings:
 Reused vocabulary:
 
 * `T(x)`        -- the model's per-patch x0 prediction (`x0_hat`).
-* `S(x)`        -- the user's score, `||T(x) - x||^2 + lambda_cls * f(cls(x))`.
+* `S(x)`        -- the Lyapunov score, `||T(x) - x||^2`.
 * `T_g(x)`      -- "x0-level CFG":  `T(null) + w * (T(cond) - T(null))`.
 * `S_g(x)`      -- "score-level CFG": `S(null) + w * (S(cond) - S(null))`.
-* `parts`       -- a debug dict of the components (residual, f_cls, x0_hat, ...)
+* `parts`       -- a debug dict of the components (residual, x0_hat, ...)
                    so callers can log / plot without re-running the model.
 """
 from __future__ import annotations
@@ -37,43 +37,23 @@ def _residual(diff: torch.Tensor, reduce: str) -> torch.Tensor:
     return flat.pow(2).sum(dim=1) if reduce == "sum" else flat.pow(2).mean(dim=1)
 
 
-def _resolve_f_cls(
-        cls_score: Optional[torch.Tensor],
-        residual: torch.Tensor,
-        *,
-        include_cls: bool,
-        lambda_cls: float,
-) -> torch.Tensor:
-    """Build the `lambda_cls * f(cls)` term, falling back to zero when the
-    model has no CLS head, the caller asked to suppress it, or `lambda_cls == 0`.
-    """
-    if include_cls and cls_score is not None and lambda_cls != 0.0:
-        return lambda_cls * cls_score
-    return torch.zeros_like(residual)
-
-
 def compute_score(
         model: LyapunovDiT,
         x: torch.Tensor,                          # [B, C, T, H, W]
         text_kv: Optional[torch.Tensor],           # [B, L, text_dim]
         text_mask: Optional[torch.Tensor],         # [B, L] bool
         *,
-        lambda_cls: float = 1.0,
         reduce: str = "sum",
-        include_cls: bool = True,
 ) -> Tuple[torch.Tensor, dict]:
-    """`S(x) = ||T(x) - x||^2 + lambda_cls * f(cls(x))`.
+    """`S(x) = ||T(x) - x||^2`.
 
-    Returns `(score [B], parts)` where parts has keys
-    `{"residual", "f_cls", "x0_hat"}`.
+    Returns `(score [B], parts)` where parts has keys `{"residual", "x0_hat"}`.
     """
     _check_reduce(reduce)
-    x0_hat, cls_score = model(x, text_kv, text_mask)
+    x0_hat = model(x, text_kv, text_mask)
     residual = _residual(x0_hat - x, reduce)
-    f_cls = _resolve_f_cls(cls_score, residual, include_cls=include_cls, lambda_cls=lambda_cls)
-    return residual + f_cls, {
+    return residual, {
         "residual": residual,
-        "f_cls":    f_cls,
         "x0_hat":   x0_hat,
     }
 
@@ -87,9 +67,7 @@ def compute_score_score_cfg(
         null_mask: torch.Tensor,                   # [1, L]
         *,
         cfg_scale: float,
-        lambda_cls: float = 1.0,
         reduce: str = "sum",
-        include_cls: bool = True,
 ) -> Tuple[torch.Tensor, dict]:
     """`S_g(x) = S(x, null) + w * (S(x, cond) - S(x, null))`.
 
@@ -104,12 +82,10 @@ def compute_score_score_cfg(
     null_kv_b   = null_kv.expand(B,   *null_kv.shape[1:])
     null_mask_b = null_mask.expand(B, *null_mask.shape[1:])
     s_cond,   parts_cond   = compute_score(
-        model, x, text_kv, text_mask,
-        lambda_cls=lambda_cls, reduce=reduce, include_cls=include_cls,
+        model, x, text_kv, text_mask, reduce=reduce,
     )
     s_uncond, parts_uncond = compute_score(
-        model, x, null_kv_b, null_mask_b,
-        lambda_cls=lambda_cls, reduce=reduce, include_cls=include_cls,
+        model, x, null_kv_b, null_mask_b, reduce=reduce,
     )
     s_g = s_uncond + cfg_scale * (s_cond - s_uncond)
     return s_g, {
@@ -129,34 +105,28 @@ def compute_score_x0_cfg(
         null_mask: torch.Tensor,
         *,
         cfg_scale: float,
-        lambda_cls: float = 1.0,
         reduce: str = "sum",
-        include_cls: bool = True,
 ) -> Tuple[torch.Tensor, dict]:
-    """`S(x) = ||T_g(x) - x||^2 + lambda_cls * f(cls_cond(x))`,
-    with `T_g(x) = T(x, null) + w * (T(x, cond) - T(x, null))`.
+    """`S(x) = ||T_g(x) - x||^2` with
+    `T_g(x) = T(x, null) + w * (T(x, cond) - T(x, null))`.
 
     "x0-level" CFG: combine the model's *outputs* (the x0 estimates), then
     measure the residual against `x`.  This matches the convention diffusion
     samplers use (their `T` is usually the eps prediction, but the algebra is
-    the same up to sign).  The CLS term comes from the conditional branch,
-    since we treat the unconditional branch as a "null prior" and want the
-    text-aware classifier to drive guidance through `f(cls)`.
+    the same up to sign), so it is the closer analog of PixArt's native CFG.
     """
     _check_reduce(reduce)
     B = x.shape[0]
     null_kv_b   = null_kv.expand(B,   *null_kv.shape[1:])
     null_mask_b = null_mask.expand(B, *null_mask.shape[1:])
 
-    x0_cond,   cls_cond   = model(x, text_kv, text_mask)
-    x0_uncond, _          = model(x, null_kv_b, null_mask_b)
+    x0_cond   = model(x, text_kv, text_mask)
+    x0_uncond = model(x, null_kv_b, null_mask_b)
     x0_g = x0_uncond + cfg_scale * (x0_cond - x0_uncond)
 
     residual = _residual(x0_g - x, reduce)
-    f_cls = _resolve_f_cls(cls_cond, residual, include_cls=include_cls, lambda_cls=lambda_cls)
-    return residual + f_cls, {
+    return residual, {
         "residual":  residual,
-        "f_cls":     f_cls,
         "x0_g":      x0_g,
         "x0_cond":   x0_cond,
         "x0_uncond": x0_uncond,
@@ -179,8 +149,8 @@ def compute_x0_guided(
     B = x.shape[0]
     null_kv_b   = null_kv.expand(B,   *null_kv.shape[1:])
     null_mask_b = null_mask.expand(B, *null_mask.shape[1:])
-    x0_cond,   _ = model(x, text_kv, text_mask)
-    x0_uncond, _ = model(x, null_kv_b, null_mask_b)
+    x0_cond   = model(x, text_kv, text_mask)
+    x0_uncond = model(x, null_kv_b, null_mask_b)
     x0_g = x0_uncond + cfg_scale * (x0_cond - x0_uncond)
     return x0_g, {"x0_cond": x0_cond, "x0_uncond": x0_uncond, "x0_g": x0_g}
 

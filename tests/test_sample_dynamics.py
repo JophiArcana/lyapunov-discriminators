@@ -20,7 +20,6 @@ def _tiny_cfg(**overrides) -> LyapunovDiTConfig:
         text_dim=16,
         text_max_len=5,
         compute_dtype="float32",
-        cls_head_hidden=16,
     )
     base.update(overrides)
     return LyapunovDiTConfig(**base)
@@ -40,16 +39,16 @@ class IdentityT(torch.nn.Module):
     """Stub LyapunovDiT-compatible model whose `T(x) = x`.
 
     Useful for testing stationary-point behavior of the sampler: at any `x`,
-    `||T(x) - x||^2 = 0` so `S(x) = 0` (with `include_cls=False`) and
-    `grad_S = 0`.  An adaptive Langevin step at this point should add zero
-    noise -- it is the headline self-cooling property of the user's variant.
+    `||T(x) - x||^2 = 0` so `S(x) = 0` and `grad_S = 0`.  An adaptive
+    Langevin step at this point should add zero noise -- it is the headline
+    self-cooling property of the user's variant.
     """
     def __init__(self):
         super().__init__()
         self.dummy = torch.nn.Parameter(torch.zeros(1))
 
     def forward(self, x, text_kv, text_mask):
-        return x, None
+        return x
 
 
 # -- Equivalence: langevin_adaptive(noise=0) == gd ----------------------------
@@ -93,7 +92,6 @@ def test_langevin_adaptive_self_cools_at_stationary_point():
         model, x.clone(), text, mask,
         n_steps=3, lr=1e-1, dynamics="langevin_adaptive",
         noise_coef=10.0,                    # huge -- but should still be zero
-        include_cls=False, lambda_cls=0.0,  # kill the f(cls) term
         record_trajectory=True,
     )
 
@@ -144,7 +142,7 @@ def test_picard_with_lr_one_jumps_to_T_of_x():
     x, text, mask = _tiny_inputs()
 
     with torch.no_grad():
-        x0_initial, _ = model(x, text, mask)
+        x0_initial = model(x, text, mask)
 
     out = sample(model, x, text, mask, n_steps=1, lr=1.0, dynamics="picard")
 

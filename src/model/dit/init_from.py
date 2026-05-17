@@ -1,10 +1,17 @@
 """Checkpoint adapters: map third-party DiT weights onto `LyapunovDiT`.
 
-The current public adapter is `init_from_pixart_sigma`.  Stubs for `dit_xl`,
-`wan21`, and `wan22_ti2v_5b` are sketched out to keep the surface honest -- a
-follow-up PR fills them in once we actually need them (Wan adapters are
-gated behind switching to `pos_embed='rope_3d'` and `text_encoder='umt5-xxl'`,
-both of which require a different VAE).
+Two public adapters cover the PixArt-Sigma checkpoint sources:
+
+* `init_from_pixart_sigma`           - the original `PixArt-alpha/PixArt-sigma`
+                                       repo layout (`.pth`, `.safetensors`).
+* `init_from_pixart_sigma_diffusers` - the diffusers-converted layout
+                                       (`PixArt-alpha/PixArt-Sigma-XL-2-*-MS`
+                                       on the Hugging Face Hub).
+
+Stubs for `dit_xl`, `wan21`, and `wan22_ti2v_5b` are sketched out to keep the
+surface honest -- a follow-up PR fills them in once we actually need them
+(Wan adapters are gated behind switching to `pos_embed='rope_3d'` and
+`text_encoder='umt5-xxl'`, both of which require a different VAE).
 
 PixArt-Sigma's state dict (see `PixArt-alpha/PixArt-sigma`'s
 `diffusion/model/nets/PixArt.py`) uses these top-level keys:
@@ -196,10 +203,178 @@ def init_from_pixart_sigma(
         print(f"[init_from_pixart_sigma] missing : {info['missing']}")
         print(f"[init_from_pixart_sigma] unexpected: {info['unexpected']}")
     if strict_shapes and info["unexpected"]:
-        # `missing` is *expected* (cls token, f_head, learnable_t, etc.); only
+        # `missing` is *expected* (learnable_t buffer, etc.); only
         # unexpected keys deserve an error.
         raise RuntimeError(
             f"PixArt-Sigma checkpoint had unexpected keys for our LyapunovDiT: "
+            f"{info['unexpected']}",
+        )
+    return info
+
+
+# -- diffusers-format adapter -------------------------------------------------
+
+# Map from the diffusers `PixArtTransformer2DModel` key space to the original
+# `PixArt-alpha/PixArt-sigma` key space.  Values like `"<i>"` are placeholders
+# for the block index, substituted at iteration time.
+#
+# Notes:
+# - Diffusers stores Q/K/V as three separate linears (`to_q`, `to_k`, `to_v`);
+#   the original PixArt fuses Q/K/V (self-attn) and K/V (cross-attn) into single
+#   linears.  We concatenate the diffusers tensors at copy time, not via a
+#   key-only rename.
+# - `pos_embed.pos_embed` (a buffer) is intentionally skipped: we recompute
+#   the same MAE-style 2D sincos in `LyapunovDiT.__init__`.
+# - `caption_projection.y_embedding` does not exist in the diffusers layout;
+#   our `y_embedder.y_embedding` remains randomly initialized.  For a fully
+#   reproducible CFG baseline use the original-repo adapter, or substitute the
+#   T5 encoding of the empty string via `null_kind='t5_empty'`.
+
+
+def init_from_pixart_sigma_diffusers(
+        model: LyapunovDiT,
+        ckpt: "str | Path | Mapping[str, torch.Tensor]",
+        *,
+        strict_shapes: bool = True,
+        verbose: bool = False,
+) -> dict:
+    """Load a diffusers-format PixArt-Sigma transformer into our `LyapunovDiT`.
+
+    Accepts the same input forms as `init_from_pixart_sigma`:
+    - path to a `.pth` / `.safetensors`,
+    - directory containing `diffusion_pytorch_model.safetensors` (the
+      diffusers `transformer/` subfolder),
+    - an already-loaded mapping.
+
+    For Hugging Face Hub repo ids, pre-resolve via
+    `huggingface_hub.snapshot_download(..., allow_patterns=['transformer/*'])`
+    and pass the resulting `transformer/` path.
+
+    Returns the same `{loaded_keys, missing, unexpected}` info dict as the
+    original adapter.
+    """
+    cfg = model.cfg
+    _validate_cfg_for_pixart(cfg)
+
+    sd = _load_diffusers_state_dict(ckpt)
+    out_state: dict[str, torch.Tensor] = {}
+
+    D = cfg.hidden_size
+
+    # -- patch embedder ----------------------------------------------------
+    # diffusers: pos_embed.proj.{weight,bias}  Conv2d.
+    pe_w = sd["pos_embed.proj.weight"]
+    if pe_w.dim() == 4:
+        pe_w = pe_w.unsqueeze(2)
+    out_state["x_embedder.weight"] = pe_w
+    out_state["x_embedder.bias"]   = sd["pos_embed.proj.bias"]
+
+    # -- adaln_single -> t_embedder + t_block -------------------------------
+    out_state["t_embedder.mlp.0.weight"] = sd["adaln_single.emb.timestep_embedder.linear_1.weight"]
+    out_state["t_embedder.mlp.0.bias"]   = sd["adaln_single.emb.timestep_embedder.linear_1.bias"]
+    out_state["t_embedder.mlp.2.weight"] = sd["adaln_single.emb.timestep_embedder.linear_2.weight"]
+    out_state["t_embedder.mlp.2.bias"]   = sd["adaln_single.emb.timestep_embedder.linear_2.bias"]
+    out_state["t_block.1.weight"]        = sd["adaln_single.linear.weight"]
+    out_state["t_block.1.bias"]          = sd["adaln_single.linear.bias"]
+
+    # -- caption_projection -> y_embedder.y_proj ----------------------------
+    if model.use_cross_attn and model.y_embedder is not None:
+        out_state["y_embedder.y_proj.fc1.weight"] = sd["caption_projection.linear_1.weight"]
+        out_state["y_embedder.y_proj.fc1.bias"]   = sd["caption_projection.linear_1.bias"]
+        out_state["y_embedder.y_proj.fc2.weight"] = sd["caption_projection.linear_2.weight"]
+        out_state["y_embedder.y_proj.fc2.bias"]   = sd["caption_projection.linear_2.bias"]
+        # y_embedding is *not* in the diffusers state dict; leave the random init.
+
+    # -- transformer blocks --------------------------------------------------
+    for i in range(cfg.depth):
+        src = f"transformer_blocks.{i}"
+        dst = f"blocks.{i}"
+        out_state[f"{dst}.scale_shift_table"] = sd[f"{src}.scale_shift_table"]
+
+        # self-attn: fuse (to_q, to_k, to_v) -> qkv along the OUTPUT dim.
+        qkv_w = torch.cat([
+            sd[f"{src}.attn1.to_q.weight"],
+            sd[f"{src}.attn1.to_k.weight"],
+            sd[f"{src}.attn1.to_v.weight"],
+        ], dim=0)
+        qkv_b = torch.cat([
+            sd[f"{src}.attn1.to_q.bias"],
+            sd[f"{src}.attn1.to_k.bias"],
+            sd[f"{src}.attn1.to_v.bias"],
+        ], dim=0)
+        out_state[f"{dst}.attn.qkv.weight"]   = qkv_w
+        out_state[f"{dst}.attn.qkv.bias"]     = qkv_b
+        out_state[f"{dst}.attn.proj.weight"]  = sd[f"{src}.attn1.to_out.0.weight"]
+        out_state[f"{dst}.attn.proj.bias"]    = sd[f"{src}.attn1.to_out.0.bias"]
+
+        if model.use_cross_attn:
+            # cross-attn: q stays separate; (to_k, to_v) -> kv_linear.
+            out_state[f"{dst}.cross_attn.q_linear.weight"] = sd[f"{src}.attn2.to_q.weight"]
+            out_state[f"{dst}.cross_attn.q_linear.bias"]   = sd[f"{src}.attn2.to_q.bias"]
+            kv_w = torch.cat([
+                sd[f"{src}.attn2.to_k.weight"],
+                sd[f"{src}.attn2.to_v.weight"],
+            ], dim=0)
+            kv_b = torch.cat([
+                sd[f"{src}.attn2.to_k.bias"],
+                sd[f"{src}.attn2.to_v.bias"],
+            ], dim=0)
+            out_state[f"{dst}.cross_attn.kv_linear.weight"] = kv_w
+            out_state[f"{dst}.cross_attn.kv_linear.bias"]   = kv_b
+            out_state[f"{dst}.cross_attn.proj.weight"]      = sd[f"{src}.attn2.to_out.0.weight"]
+            out_state[f"{dst}.cross_attn.proj.bias"]        = sd[f"{src}.attn2.to_out.0.bias"]
+
+        # MLP: ff.net.0.proj -> fc1, ff.net.2 -> fc2.
+        out_state[f"{dst}.mlp.fc1.weight"] = sd[f"{src}.ff.net.0.proj.weight"]
+        out_state[f"{dst}.mlp.fc1.bias"]   = sd[f"{src}.ff.net.0.proj.bias"]
+        out_state[f"{dst}.mlp.fc2.weight"] = sd[f"{src}.ff.net.2.weight"]
+        out_state[f"{dst}.mlp.fc2.bias"]   = sd[f"{src}.ff.net.2.bias"]
+
+    # -- final layer ---------------------------------------------------------
+    # Top-level `scale_shift_table` (note: shadowed by per-block table; this is
+    # the post-trunk one corresponding to our `final_layer.scale_shift_table`).
+    out_state["final_layer.scale_shift_table"] = sd["scale_shift_table"]
+
+    final_w = sd["proj_out.weight"]                                  # [p^2 * 2C, D]
+    final_b = sd["proj_out.bias"]                                    # [p^2 * 2C]
+    if cfg.out_multiplier == 2:
+        out_state["final_layer.linear.weight"] = final_w
+        out_state["final_layer.linear.bias"]   = final_b
+    elif cfg.out_multiplier == 1:
+        P = cfg.patch_volume()
+        C = cfg.latent_channels
+        if final_w.shape[0] != 2 * P * C:
+            raise ValueError(
+                f"diffusers proj_out.weight has shape {tuple(final_w.shape)}; "
+                f"expected leading {2 * P * C} for out_multiplier=1 truncation."
+            )
+        out_state["final_layer.linear.weight"] = (
+            final_w.reshape(P, 2 * C, -1)[:, :C].reshape(P * C, -1).contiguous()
+        )
+        out_state["final_layer.linear.bias"] = (
+            final_b.reshape(P, 2 * C)[:, :C].reshape(P * C).contiguous()
+        )
+        if verbose:
+            warnings.warn(
+                "Truncating diffusers proj_out to mean channels only (out_multiplier=1)."
+            )
+    else:
+        raise ValueError(f"Unsupported out_multiplier={cfg.out_multiplier} for PixArt init")
+
+    # -- copy ----------------------------------------------------------------
+    incompat = model.load_state_dict(out_state, strict=False)
+    info = {
+        "loaded_keys": sorted(out_state.keys()),
+        "missing":     list(incompat.missing_keys),
+        "unexpected":  list(incompat.unexpected_keys),
+    }
+    if verbose:
+        print(f"[init_from_pixart_sigma_diffusers] loaded {len(info['loaded_keys'])} tensors")
+        print(f"[init_from_pixart_sigma_diffusers] missing : {info['missing']}")
+        print(f"[init_from_pixart_sigma_diffusers] unexpected: {info['unexpected']}")
+    if strict_shapes and info["unexpected"]:
+        raise RuntimeError(
+            f"diffusers PixArt-Sigma checkpoint had unexpected keys for our LyapunovDiT: "
             f"{info['unexpected']}",
         )
     return info
@@ -291,8 +466,37 @@ def _load_state_dict(ckpt) -> Mapping[str, torch.Tensor]:
     return ckpt
 
 
+def _load_diffusers_state_dict(ckpt) -> Mapping[str, torch.Tensor]:
+    """Resolve a diffusers PixArt-Sigma `transformer/` checkpoint.
+
+    Accepted inputs:
+    - `.safetensors` file path -> loaded directly.
+    - `.pth` / `.bin` file path -> `torch.load`.
+    - directory path -> looks for `diffusion_pytorch_model.safetensors` then
+      `diffusion_pytorch_model.bin`.  This is the layout produced by
+      `huggingface_hub.snapshot_download` of any `PixArt-alpha/PixArt-Sigma-*`
+      repo's `transformer/` subfolder.
+    - already-loaded mapping -> passed through.
+    """
+    if isinstance(ckpt, (str, Path)):
+        path = Path(ckpt)
+        if path.is_dir():
+            for candidate in ("diffusion_pytorch_model.safetensors",
+                              "diffusion_pytorch_model.bin"):
+                p = path / candidate
+                if p.is_file():
+                    return _load_state_dict(p)
+            raise FileNotFoundError(
+                f"No diffusion_pytorch_model.{{safetensors,bin}} under {path!r}. "
+                "Point at the `transformer/` subfolder of the diffusers checkpoint."
+            )
+        return _load_state_dict(path)
+    return ckpt
+
+
 __all__ = [
     "init_from_pixart_sigma",
+    "init_from_pixart_sigma_diffusers",
     "init_from_dit_xl_2",
     "init_from_wan21",
     "init_from_wan22_ti2v_5b",

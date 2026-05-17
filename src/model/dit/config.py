@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Literal, Tuple
 
+
 # -- enums-as-string-literals -------------------------------------------------
 # Plain `Literal` types (rather than `enum.Enum`) keep configs trivially
 # JSON/yaml-serializable without a custom encoder.
@@ -59,12 +60,14 @@ ModulationKind = Literal[
     # No adaLN modulation at all.  Plain ViT block.  Loses the entire pretrained
     # adaLN MLP if you init from a DiT.
     "none",
-    # Keep the t_embedder + t_block MLPs from PixArt; feed them a learnable
-    # vector (shape `[hidden]`) initialized at the t=t_min embedding.  Default.
-    "learnable_const",
     # Keep the t_embedder + t_block MLPs from PixArt; feed a fixed scalar `t`
-    # value (no gradient).  Useful for sanity-check baselines.
+    # value (no gradient).  Default flavor: ideal for the frozen-baseline
+    # experiment because no parameter PixArt has never seen is introduced.
     "fixed_t",
+    # Same plumbing but the scalar is a trainable `nn.Parameter` (initialized
+    # at `fixed_t_value`).  Use when fine-tuning and you want the model to
+    # drift the timestep input during training.
+    "learnable_const",
 ]
 
 NullKind = Literal[
@@ -110,9 +113,20 @@ class LyapunovDiTConfig:
     - `patch_size = (1, p, p)`: T=1 specializes to a 2D ViT patch.  Set T_p > 1
       only when the VAE keeps a temporal dimension.
     - `out_multiplier`: PixArt's pretrained head outputs `2 * latent_channels`
-      (mean + variance).  Set to 2 when initializing from PixArt to absorb the
-      full pretrained final-linear weights; we slice off the variance half at
-      loss time.  Set to 1 for from-scratch runs.
+      (mean + variance).  The default `2` absorbs the full pretrained
+      final-linear weights when initializing from PixArt; the variance half is
+      sliced off inside `forward` before the residual is computed, so the
+      observable `T(x)` is unaffected.  Set to `1` to skip the variance head
+      entirely (smaller model; required for non-PixArt-initialized runs that
+      don't want the dead capacity).
+    - `modulation`: defaults to `"fixed_t"` so that an init-from-PixArt model
+      with no other changes is fully reproducible -- there are no parameters
+      PixArt has never seen.  `fixed_t_value` is the timestep scalar fed
+      through the kept `t_embedder + t_block` stack and is the primary
+      experiment knob for the frozen-baseline run.  PixArt uses the
+      diffusers 1000-step convention where `t=0` is clean and `t=999` is pure
+      noise; mid-schedule values like `t=500` are usually most informative
+      for descent on `||T(x) - x||^2`.
     - When `text_encoder == "none"`, `cross_attn_per_block` is forced off.
     """
     # -- backbone shape ------------------------------------------------------
@@ -135,12 +149,14 @@ class LyapunovDiTConfig:
     pos_embed: PosEmbedKind = "absolute_2d"
 
     # -- modulation ----------------------------------------------------------
-    modulation: ModulationKind = "learnable_const"
+    # See class docstring for the choice of `fixed_t` as default.
+    modulation: ModulationKind = "fixed_t"
+    # Primary experiment knob.  Fed verbatim through the PixArt-compatible
+    # `t_embedder + t_block` stack in BOTH the `fixed_t` and `learnable_const`
+    # branches (in the latter, it is the initial value of the learnable
+    # `nn.Parameter`).  PixArt's convention: `t in [0, 1000)`, with `t=0`
+    # clean and `t=999` pure noise.
     fixed_t_value: float = 0.0
-    # When `modulation == "learnable_const"`, this is the scalar fed into the
-    # PixArt-compatible `t_embedder + t_block` at init time.  Choose 0 when you
-    # want clean latents (post-init the param can drift via gradient descent).
-    learnable_t_init: float = 0.0
 
     # -- text conditioning ---------------------------------------------------
     text_encoder: TextEncoderName = "t5-v1_1-xxl"
@@ -151,10 +167,7 @@ class LyapunovDiTConfig:
     null_token_count: int = 120            # only used when null_kind == "learnable"
 
     # -- output heads --------------------------------------------------------
-    out_multiplier: int = 1                # set to 2 for clean PixArt init
-    use_cls_head: bool = True
-    cls_pool: Literal["mean", "cls_token"] = "mean"
-    cls_head_hidden: int = 256
+    out_multiplier: int = 2                # 2 = clean PixArt init; 1 = no variance head
 
     # -- training-side -------------------------------------------------------
     p_uncond: float = 0.1

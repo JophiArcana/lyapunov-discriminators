@@ -1,9 +1,9 @@
 """Score-based sampler for `LyapunovDiT`.
 
 Given a trained `LyapunovDiT` and a starting latent `x_init`, run gradient
-descent on the user-defined Lyapunov-style score
+descent on the Lyapunov-style score
 
-    S(x) = ||T(x) - x||^2 + lambda_cls * f(cls(x))
+    S(x) = ||T(x) - x||^2
 
 where `T(x)` is the model's per-patch x0 prediction.  Since `T` is a
 *differentiable* neural network, `S` is differentiable in `x` and we can
@@ -24,13 +24,14 @@ Four dynamics are supported, all driven by the same gradient:
 CFG comes in two flavors that produce *genuinely different* trajectories
 unless `cfg_scale == 0`:
 
+    cfg_mode="x0"   : build `T_g = T(null) + w*(T(cond) - T(null))` and use
+                      `||T_g - x||^2` as the energy.  Closest analog to
+                      PixArt's native CFG (which mixes model outputs, not
+                      scalar energies).  Picard always uses this flavor.
+
     cfg_mode="score": differentiate `S_g = S(null) + w*(S(cond) - S(null))`.
                       Two forward passes, two backward passes, autograd does
                       the linear combination of gradients for free.
-
-    cfg_mode="x0"   : build `T_g = T(null) + w*(T(cond) - T(null))` and use
-                      `||T_g - x||^2 + lambda_cls*f(cls(cond))` as the energy.
-                      Picard always uses this flavor.
 
 Math notes
 ----------
@@ -144,29 +145,22 @@ def _score_step(
         *,
         cfg_scale: float,
         cfg_mode: CFGMode,
-        lambda_cls: float,
         reduce: Reduce,
-        include_cls: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """One score evaluation + one backward.  Returns (`grad_x [B,...]`, `score [B]`)."""
     if cfg_scale == 0.0:
-        score, _ = compute_score(
-            model, x, text_kv, text_mask,
-            lambda_cls=lambda_cls, reduce=reduce, include_cls=include_cls,
-        )
+        score, _ = compute_score(model, x, text_kv, text_mask, reduce=reduce)
     elif cfg_mode == "score":
         assert null_kv is not None and null_mask is not None
         score, _ = compute_score_score_cfg(
             model, x, text_kv, text_mask, null_kv, null_mask,
-            cfg_scale=cfg_scale, lambda_cls=lambda_cls,
-            reduce=reduce, include_cls=include_cls,
+            cfg_scale=cfg_scale, reduce=reduce,
         )
     else:  # cfg_mode == "x0"
         assert null_kv is not None and null_mask is not None
         score, _ = compute_score_x0_cfg(
             model, x, text_kv, text_mask, null_kv, null_mask,
-            cfg_scale=cfg_scale, lambda_cls=lambda_cls,
-            reduce=reduce, include_cls=include_cls,
+            cfg_scale=cfg_scale, reduce=reduce,
         )
     grad = torch.autograd.grad(score.sum(), x, create_graph=False)[0]
     return grad, score.detach()
@@ -186,12 +180,10 @@ def sample(
         dynamics: Dynamics = "langevin_adaptive",
         noise_coef: float = 0.1,
         cfg_scale: float = 0.0,
-        cfg_mode: CFGMode = "score",
+        cfg_mode: CFGMode = "x0",
         null_kv: Optional[torch.Tensor] = None,
         null_mask: Optional[torch.Tensor] = None,
-        lambda_cls: float = 1.0,
         reduce: Reduce = "sum",
-        include_cls: bool = True,
         seed: Optional[int] = None,
         on_step: Optional[Callable[[int, dict], None]] = None,
         record_trajectory: bool = False,
@@ -220,17 +212,15 @@ def sample(
         Standard diffusion CFG uses values like 1.5-7.5; for a Lyapunov
         score the calibration is unknown and should be tuned empirically.
     cfg_mode:
-        `"score"`: linearly mix the two scalar scores, autograd handles the rest.
         `"x0"`:    linearly mix the two model outputs `T(.)`, then square.
+                   Default; matches PixArt's native CFG (which mixes model
+                   outputs, not scalar energies).
+        `"score"`: linearly mix the two scalar scores, autograd handles the rest.
         Picard always uses `"x0"`-style mixing regardless of this argument.
     null_kv, null_mask:
         Required when `cfg_scale != 0`.  Broadcast across the batch.
-    lambda_cls:
-        Weight on `f(cls(x))` inside `S`.  Set to `0.0` to suppress.
     reduce:
         How to reduce the residual across (C, T, H, W).
-    include_cls:
-        Whether to include the `f(cls)` term at all.
     seed:
         If set, controls the noise generator (Langevin only).
     on_step:
@@ -269,7 +259,7 @@ def sample(
                             cfg_scale=cfg_scale,
                         )
                     else:
-                        x0_target, _ = model(x, text_kv, text_mask)
+                        x0_target = model(x, text_kv, text_mask)
                     update = x0_target - x
                     residual_sq = update.reshape(update.shape[0], -1).pow(2).sum(dim=1)
                     x = x + lr * update
@@ -281,8 +271,7 @@ def sample(
                 x = x.detach().requires_grad_(True)
                 grad, score = _score_step(
                     model, x, text_kv, text_mask, null_kv, null_mask,
-                    cfg_scale=cfg_scale, cfg_mode=cfg_mode,
-                    lambda_cls=lambda_cls, reduce=reduce, include_cls=include_cls,
+                    cfg_scale=cfg_scale, cfg_mode=cfg_mode, reduce=reduce,
                 )
                 grad_norm = _per_sample_norm(grad).detach()
 

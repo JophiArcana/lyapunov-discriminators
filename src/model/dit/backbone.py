@@ -3,15 +3,13 @@
 This is a DiT-style vision transformer in frozen-VAE latent space, optionally
 cross-attending to a frozen-T5 token sequence at every block.  Input shape is
 `[B, C, T, H, W]` (with `T=1` for images, the natural single-frame degenerate
-case of the same code).  Output is two-headed:
+case of the same code).  Output is a single per-patch x0 head:
 
-* **per-patch x0 head**: `[B, C', T, H, W]` -- predicted clean latent.
-  `C'` equals `cfg.latent_channels * cfg.out_multiplier`; for runs initialized
-  from PixArt-Sigma we keep `out_multiplier=2` and slice the variance half off
-  in the loss.
-
-* **scalar f(cls) head**: `[B]` (or `[B, 1]`) -- pooled scalar augment for the
-  Lyapunov-style score `||T(x) - x||^2 + f(cls)` at inference time.
+* `[B, C', T, H, W]` -- predicted clean latent.  `C'` equals
+  `cfg.latent_channels * cfg.out_multiplier`; for runs initialized from
+  PixArt-Sigma we keep `out_multiplier=2` and slice the variance half off
+  inside `forward`, so the returned tensor always has `cfg.latent_channels`
+  channels.
 
 Internally we reuse PixArt-Sigma's adaLN-single + cross-attn block layout so
 that:
@@ -22,9 +20,10 @@ that:
 
 The timestep machinery is *kept* (TimestepEmbedder + a 6*D linear "t_block")
 even though we never expose timesteps as inputs.  The default modulation
-flavor `learnable_const` feeds a single learnable scalar through that stack,
-which preserves PixArt's pretrained adaLN MLP exactly while letting the model
-drift the constant during training.
+flavor `fixed_t` feeds a single non-trainable scalar through that stack,
+which preserves PixArt's pretrained adaLN MLP exactly for a fully-frozen
+baseline run.  The `learnable_const` flavor swaps the buffer for a learnable
+scalar when fine-tuning is desired.
 """
 from __future__ import annotations
 
@@ -38,7 +37,7 @@ import torch.nn.functional as F
 from .config import LyapunovDiTConfig
 from .blocks import (
     DiTBlock, FinalLayer, TimestepEmbedder, CaptionEmbedder,
-    Mlp, RoPE3DCache,
+    RoPE3DCache,
     get_2d_sincos_pos_embed, get_3d_sincos_pos_embed,
 )
 
@@ -66,7 +65,6 @@ class LyapunovDiT(nn.Module):
                                                        discarded variance channels are
                                                        still present in the head's
                                                        weights but not in the return value.)
-        cls_score:  [B] or None     -- only when cfg.use_cls_head; the scalar `f(cls)` term.
     """
 
     def __init__(self, cfg: LyapunovDiTConfig) -> None:
@@ -114,16 +112,17 @@ class LyapunovDiT(nn.Module):
         # state_dict shapes are stable.  Their parameters just don't get used.
         self.t_embedder = TimestepEmbedder(D)
         self.t_block    = nn.Sequential(nn.SiLU(), nn.Linear(D, 6 * D, bias=True))
-        if cfg.modulation == "learnable_const":
-            # A single learnable scalar fed into the (frozen-able) PixArt
-            # timestep MLP.  Init to the user-specified value so a fresh model
-            # starts with a known modulation regime.
-            self.learnable_t = nn.Parameter(
-                torch.full((1,), float(cfg.learnable_t_init)),
-            )
-        elif cfg.modulation == "fixed_t":
+        if cfg.modulation == "fixed_t":
+            # Non-trainable buffer: PixArt-init runs are bit-reproducible since
+            # no parameter PixArt has never seen is introduced.
             self.register_buffer(
                 "learnable_t", torch.full((1,), float(cfg.fixed_t_value)), persistent=True,
+            )
+        elif cfg.modulation == "learnable_const":
+            # A single learnable scalar fed into the PixArt timestep MLP.  Init
+            # at `fixed_t_value` so a fresh model starts with a known regime.
+            self.learnable_t = nn.Parameter(
+                torch.full((1,), float(cfg.fixed_t_value)),
             )
         else:
             self.learnable_t = None  # type: ignore[assignment]
@@ -156,29 +155,6 @@ class LyapunovDiT(nn.Module):
             D, patch_volume=cfg.patch_volume(), out_channels=out_C,
             norm_eps=cfg.norm_eps,
         )
-
-        # -- CLS / scalar head ------------------------------------------------
-        if cfg.use_cls_head:
-            if cfg.cls_pool == "cls_token":
-                # cls_token + rope_3d is awkward: the RoPE tables are sized for
-                # exactly t*h*w tokens, and the CLS at position (0,0,0) is *not*
-                # a no-op rotation (it just multiplies by 1+0i, fine, but it
-                # also makes downstream slicing indices fragile if the layout
-                # changes).  Disallow the combination outright until we have a
-                # reason to support it.
-                if cfg.pos_embed == "rope_3d":
-                    raise ValueError(
-                        "cls_pool='cls_token' is not currently supported with "
-                        "pos_embed='rope_3d'.  Use cls_pool='mean' or switch to "
-                        "an absolute pos_embed."
-                    )
-                self.cls_token = nn.Parameter(torch.randn(1, 1, D) / D ** 0.5)
-            else:
-                self.cls_token = None  # type: ignore[assignment]
-            self.f_head = Mlp(D, cfg.cls_head_hidden, out_features=1)
-        else:
-            self.cls_token = None  # type: ignore[assignment]
-            self.f_head = None  # type: ignore[assignment]
 
         self._init_weights()
 
@@ -276,7 +252,7 @@ class LyapunovDiT(nn.Module):
             x: torch.Tensor,                              # [B, C, T, H, W]
             text_kv: Optional[torch.Tensor] = None,        # [B, L, text_dim]
             text_mask: Optional[torch.Tensor] = None,      # [B, L] bool
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         cfg = self.cfg
         device, compute_dtype = x.device, x.dtype
 
@@ -294,10 +270,6 @@ class LyapunovDiT(nn.Module):
         elif cfg.pos_embed == "rope_3d":
             assert self.rope is not None
             self.rope.configure(t_grid, h_grid, w_grid, device, tokens.dtype)
-
-        # -- CLS token (only when use_cls_head and cls_pool == "cls_token") ----
-        if cfg.use_cls_head and cfg.cls_pool == "cls_token" and self.cls_token is not None:
-            tokens = torch.cat([self.cls_token.expand(tokens.shape[0], -1, -1), tokens], dim=1)
 
         # -- modulation input ---------------------------------------------------
         t_emb = self._modulation_input(x.shape[0], device, tokens.dtype)      # [B, D] or None
@@ -322,16 +294,6 @@ class LyapunovDiT(nn.Module):
         for block in self.blocks:
             tokens = block(tokens, mod, y, text_mask, rope=self.rope)
 
-        # -- split CLS slot back out, if any ------------------------------------
-        cls_score: Optional[torch.Tensor] = None
-        if cfg.use_cls_head and self.f_head is not None:
-            if cfg.cls_pool == "cls_token":
-                cls_feat = tokens[:, 0]                                        # [B, D]
-                tokens   = tokens[:, 1:]                                       # [B, N, D]
-            else:
-                cls_feat = tokens.mean(dim=1)                                  # [B, D]
-            cls_score = self.f_head(cls_feat).squeeze(-1)                      # [B]
-
         # -- final layer (per-patch x0) ----------------------------------------
         # The final layer wants the same `t_emb` as the blocks (PixArt convention).
         # When modulation is disabled, pass zeros so the scale_shift_table acts alone.
@@ -344,7 +306,7 @@ class LyapunovDiT(nn.Module):
 
         # Slice off the variance/extra channels reserved for clean PixArt init.
         x0_hat = x0_hat_full[:, : cfg.latent_channels]
-        return x0_hat, cls_score
+        return x0_hat
 
 
 __all__ = ["LyapunovDiT"]

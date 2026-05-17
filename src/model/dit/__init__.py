@@ -19,7 +19,8 @@ from .losses import denoiser_loss, drop_text, make_noisy
 from .backbone import LyapunovDiT
 from .infer import lyapunov_score, cfg_analog_score
 from .sample import sample
-from .init_from import init_from_pixart_sigma
+from .init_from import init_from_pixart_sigma, init_from_pixart_sigma_diffusers
+from .baseline import make_pixart_baseline, pixart_sigma_baseline_config
 
 __all__ = [
     "LyapunovDiTConfig",
@@ -37,4 +38,7 @@ __all__ = [
     "cfg_analog_score",
     "sample",
     "init_from_pixart_sigma",
+    "init_from_pixart_sigma_diffusers",
+    "make_pixart_baseline",
+    "pixart_sigma_baseline_config",
 ]

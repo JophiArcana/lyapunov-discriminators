@@ -201,8 +201,8 @@ def train(
         if text_kv is not None and null_kv is not None and cfg.p_uncond > 0:
             text_kv, text_mask = drop_text(text_kv, text_mask, null_kv, null_mask, cfg.p_uncond)
 
-        x0_hat, cls = model(x, text_kv, text_mask)
-        out = denoiser_loss(x0_hat, x0, sigma, cfg, cls_score=cls)
+        x0_hat = model(x, text_kv, text_mask)
+        out = denoiser_loss(x0_hat, x0, sigma, cfg)
         loss = out["loss"]
 
         optim.zero_grad(set_to_none=True)

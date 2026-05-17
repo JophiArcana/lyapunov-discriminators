@@ -110,18 +110,13 @@ def denoiser_loss(
         x0:     torch.Tensor,         # [B, C, T, H, W]   ground-truth clean latent
         sigma:  torch.Tensor,         # [B]               the per-sample noise level used
         cfg:    LyapunovDiTConfig,
-        *,
-        cls_score: Optional[torch.Tensor] = None,    # [B] from the f(cls) head
-        cls_target: Optional[torch.Tensor] = None,   # [B] -- only when cls_target is supervised
-        lambda_cls: float = 0.0,
 ) -> dict:
-    """Compute the x0-MSE loss with optional EDM weighting and CLS auxiliary term.
+    """Compute the x0-MSE loss with optional EDM weighting.
 
     Returns a dict with:
-      - `"loss"`     : the scalar to backprop on.
-      - `"x0_mse"`   : per-sample MSE (mean over voxels), shape [B].
-      - `"weight"`   : applied per-sample weight, shape [B].
-      - `"cls_loss"` : per-sample CLS loss (MSE) when supervised; else 0-d zero.
+      - `"loss"`   : the scalar to backprop on.
+      - `"x0_mse"` : per-sample MSE (mean over voxels), shape [B].
+      - `"weight"` : applied per-sample weight, shape [B].
 
     The dict shape lets callers (logging, weighted sums for FSDP) consume the
     components without recomputing.
@@ -139,25 +134,12 @@ def denoiser_loss(
     else:
         w = torch.ones_like(per_sample_mse)
     weighted = w * per_sample_mse
-    main_loss = weighted.mean()
-
-    if (
-        cls_score is not None
-        and cls_target is not None
-        and lambda_cls > 0.0
-    ):
-        cls_loss_per = F.mse_loss(cls_score, cls_target.to(cls_score.dtype), reduction="none")
-        cls_loss = cls_loss_per.mean()
-        total = main_loss + lambda_cls * cls_loss
-    else:
-        cls_loss = torch.zeros((), device=x0.device, dtype=main_loss.dtype)
-        total = main_loss
+    loss = weighted.mean()
 
     return {
-        "loss":     total,
-        "x0_mse":   per_sample_mse.detach(),
-        "weight":   w.detach(),
-        "cls_loss": cls_loss.detach(),
+        "loss":   loss,
+        "x0_mse": per_sample_mse.detach(),
+        "weight": w.detach(),
     }
 
 
