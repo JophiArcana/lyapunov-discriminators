@@ -1,0 +1,14 @@
+.DS_Store
+.git/
+.idea/
+__pycache__/
+output/
+data/
+venv/
+*.pt
+*.mp4
+*.pyc
+*.egg-info/
+build/
+dist/
+*.egg
