@@ -299,10 +299,24 @@ class TimestepEmbedder(nn.Module):
 class CaptionEmbedder(nn.Module):
     """PixArt's `CaptionEmbedder`: a 2-layer MLP that projects T5 features to D.
 
-    Unlike PixArt we do not own the unconditional dropout *here*; the `p_uncond`
-    text drop happens upstream in `losses.drop_text` (so the cache pipeline can
-    stay separate from the model).  We still expose a learnable `y_embedding`
-    null token sequence that the caller swaps in via `drop_text`.
+    The learnable `y_embedding` (`[null_token_count, in_channels]`) is the
+    PixArt-style per-token null sequence.  Two ways it participates in the
+    forward:
+
+    1. **Per-token mask substitution inside `forward`**: when `text_mask` is
+       passed AND `null_token_count == L` (i.e. the null sequence is sized
+       to match the conditioning sequence), positions where `text_mask` is
+       False are replaced with the projected `y_embedding` row.  This is the
+       per-token analog of PixArt's per-sample `token_drop`.
+    2. **Caller-side null tensor for CFG**: `null_kv()` returns the
+       unprojected `y_embedding` as a `[1, null_token_count, in_channels]`
+       tensor, ready to be passed as `null_kv` to `sample(...)` /
+       `drop_text(...)`.  Use this when CFG should mix against the learnable
+       null instead of the T5 encoding of `""`.
+
+    The unconditional dropout *probability* is not owned here -- `losses.drop_text`
+    decides which samples to drop so the cache pipeline can stay separate from
+    the model.
     """
     def __init__(self, in_channels: int, hidden_size: int, *, null_token_count: int = 120) -> None:
         super().__init__()
@@ -312,13 +326,41 @@ class CaptionEmbedder(nn.Module):
             "y_embedding",
             nn.Parameter(torch.randn(null_token_count, in_channels) / in_channels ** 0.5),
         )
+        self.null_token_count = null_token_count
 
-    def forward(self, caption: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            caption: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """`caption`: [B, L, in_channels] (T5 features, already padded/truncated).
+        `mask`:    [B, L] bool, True = keep caption row, False = substitute null.
 
         Returns [B, L, hidden_size].
+
+        When `mask` is provided AND `null_token_count == L`, positions where
+        `mask` is False are replaced with the projected `y_embedding` row.
+        When the shapes don't match (legacy configs / diffusers init with a
+        differently-sized null), the mask is silently ignored and only the
+        caption is projected -- callers that want to enforce the null in this
+        regime should pre-substitute on `caption` itself.
         """
-        return self.y_proj(caption)
+        y = self.y_proj(caption)                                      # [B, L, D]
+        if mask is not None and self.y_embedding.shape[0] == y.shape[1]:
+            y_null = self.y_proj(self.y_embedding)                    # [L, D]
+            y_null = y_null.to(dtype=y.dtype).unsqueeze(0).expand_as(y)
+            y = torch.where(mask.unsqueeze(-1), y, y_null)
+        return y
+
+    def null_kv(self, *, batch_size: int = 1) -> torch.Tensor:
+        """Return `y_embedding` shaped as a `null_kv` for CFG / drop_text.
+
+        Shape: `[batch_size, null_token_count, in_channels]`.  The same
+        tensor is passed through the cross-attention's `kv_linear`, so it
+        lives in the *unprojected* (T5-feature) space and goes through
+        `y_proj` later -- matching the convention `text_kv` uses.
+        """
+        return self.y_embedding.unsqueeze(0).expand(batch_size, -1, -1)
 
 
 # -- positional embeddings ----------------------------------------------------

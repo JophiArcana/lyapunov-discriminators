@@ -1,15 +1,24 @@
-"""One-call constructor for the frozen-PixArt-Sigma baseline experiment.
+"""One-call constructors for the frozen-PixArt-Sigma baseline experiment.
 
 The "denoising-as-energy applied to a frozen baseline" experiment is:
 build a `LyapunovDiT` whose forward pass mirrors PixArt-Sigma's as closely
 as possible, load PixArt-Sigma's pretrained weights, freeze every parameter,
 and then run gradient descent on `||T(x) - x||^2`.
 
-This helper bundles the right config defaults (PixArt-Sigma-XL/2 geometry +
-`modulation="fixed_t"` + `out_multiplier=2`), the init adapter, and the
-`requires_grad_(False)` / `eval()` calls.  It exists so the call site cannot
-accidentally introduce a free parameter PixArt has never seen, which would
-silently corrupt the baseline comparison.
+PixArt-Sigma's transformer head predicts noise (eps), not x0, so the bare
+backbone is wrapped in `EpsTweedieDenoiser` before being returned.  The
+wrapper converts the eps output to an x0 prediction via Tweedie's identity
+evaluated at the same `fixed_t` the backbone's adaLN modulation is keyed
+on, so the two are guaranteed to agree.
+
+Two adapter variants:
+
+* `make_pixart_baseline`          -- original PixArt-Sigma repo layout
+                                     (`.pth` / `.safetensors` with the fused
+                                     qkv keys).
+* `make_pixart_baseline_diffusers`-- diffusers-converted layout
+                                     (`transformer/diffusion_pytorch_model.*`
+                                     with separate q/k/v linears).
 """
 from __future__ import annotations
 
@@ -18,9 +27,10 @@ from typing import Mapping, Optional, Union
 
 import torch
 
+from ..baseline import BetaSchedule, EpsTweedieDenoiser
 from .backbone import LyapunovDiT
 from .config import LyapunovDiTConfig, TextEncoderName
-from .init_from import init_from_pixart_sigma
+from .init_from import init_from_pixart_sigma, init_from_pixart_sigma_diffusers
 
 
 CkptLike = Union[str, Path, Mapping[str, torch.Tensor]]
@@ -28,7 +38,7 @@ CkptLike = Union[str, Path, Mapping[str, torch.Tensor]]
 
 def pixart_sigma_baseline_config(
         *,
-        fixed_t: float,
+        fixed_t: int,
         text_encoder: TextEncoderName = "t5-v1_1-xxl",
         max_hw_tokens: int = 64,
         compute_dtype: str = "bfloat16",
@@ -42,9 +52,11 @@ def pixart_sigma_baseline_config(
     Parameters
     ----------
     fixed_t:
-        The non-trainable scalar fed into the kept `t_embedder + t_block`.
-        PixArt's diffusers convention: `[0, 1000)` with 0 == clean.  This is
-        the primary experiment knob.
+        Integer timestep in `[0, 1000)` (PixArt's diffusers convention,
+        with 0 == clean and 999 == pure noise).  Fed through the kept
+        `t_embedder + t_block` stack AND used by the Tweedie wrapper for
+        the eps -> x0 conversion -- the two MUST agree, which is why this
+        helper takes a single source of truth.
     text_encoder:
         Tag for the T5 encoder (caching / tokenizer routing); does not
         change weights.
@@ -70,7 +82,7 @@ def pixart_sigma_baseline_config(
         fixed_t_value=float(fixed_t),
         text_encoder=text_encoder,
         text_dim=4096,
-        text_max_len=256,
+        text_max_len=300,
         cross_attn_per_block=True,
         null_kind="learnable",
         null_token_count=120,
@@ -79,36 +91,65 @@ def pixart_sigma_baseline_config(
     )
 
 
+def _finalize(
+        backbone: LyapunovDiT,
+        fixed_t: int,
+        device: Optional[torch.device],
+        dtype: Optional[torch.dtype],
+) -> EpsTweedieDenoiser:
+    """Shared post-load wiring used by both adapter variants.
+
+    Moves the backbone to (device, dtype), freezes it, wraps it in a
+    Tweedie eps->x0 adapter, then freezes / eval-s the wrapper too (so
+    the schedule buffers also live in the right place).
+    """
+    if device is not None or dtype is not None:
+        backbone = backbone.to(device=device, dtype=dtype)
+    backbone.requires_grad_(False)
+    backbone.eval()
+
+    schedule = BetaSchedule.pixart_sigma()
+    wrapper = EpsTweedieDenoiser(backbone, schedule, fixed_t)
+    if device is not None or dtype is not None:
+        wrapper = wrapper.to(device=device, dtype=dtype)
+    wrapper.requires_grad_(False)
+    wrapper.eval()
+    return wrapper
+
+
 def make_pixart_baseline(
         ckpt: CkptLike,
         *,
-        fixed_t: float,
+        fixed_t: int,
         text_encoder: TextEncoderName = "t5-v1_1-xxl",
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         verbose: bool = False,
-) -> LyapunovDiT:
-    """Build a fully-frozen PixArt-Sigma baseline ready for descent.
+) -> EpsTweedieDenoiser:
+    """Build a fully-frozen PixArt-Sigma baseline ready for descent on
+    `||T(x) - x||^2`.
 
     Steps performed:
 
     1. Construct a `LyapunovDiT` with `pixart_sigma_baseline_config(fixed_t=...)`.
-    2. Call `init_from_pixart_sigma(model, ckpt, strict_shapes=True)`.
-    3. Move to `device` / `dtype` if either is provided.
-    4. `model.requires_grad_(False)` and `model.eval()`.
+    2. Call `init_from_pixart_sigma(backbone, ckpt, strict_shapes=True)`.
+    3. Move to `device` / `dtype` if either is provided; freeze; `.eval()`.
+    4. Wrap in `EpsTweedieDenoiser(backbone, BetaSchedule.pixart_sigma(),
+       fixed_t)` so the returned module exposes an x0 prediction.
 
-    Returns the frozen module.  Caller is expected to feed the result into
-    `sample(...)` for descent on `||T(x) - x||^2`.
+    The returned wrapper has zero learnable parameters (the backbone is
+    frozen; the wrapper itself holds only schedule buffers).  Feed it to
+    `sample(...)` directly.
 
     Parameters
     ----------
     ckpt:
         Path to a raw PixArt-Sigma `.pth` / `.safetensors`, or an
-        already-loaded mapping.  For diffusers-format checkpoints use
-        `init_from_pixart_sigma_diffusers` and pass the model to this helper
-        instead via the `model` overload (not implemented in v1).
+        already-loaded mapping (the original `PixArt-alpha/PixArt-sigma`
+        repo layout with fused `qkv` keys).  For diffusers-format
+        checkpoints use `make_pixart_baseline_diffusers` instead.
     fixed_t:
-        The fixed timestep scalar.  See `pixart_sigma_baseline_config`.
+        Integer DDPM timestep.  See `pixart_sigma_baseline_config`.
     text_encoder:
         Encoder tag (does not change weights).  Defaults to PixArt-Sigma's
         actual encoder (`t5-v1_1-xxl`).
@@ -119,13 +160,40 @@ def make_pixart_baseline(
         Forwarded to `init_from_pixart_sigma`.
     """
     cfg = pixart_sigma_baseline_config(fixed_t=fixed_t, text_encoder=text_encoder)
-    model = LyapunovDiT(cfg)
-    init_from_pixart_sigma(model, ckpt, strict_shapes=True, verbose=verbose)
-    if device is not None or dtype is not None:
-        model = model.to(device=device, dtype=dtype)
-    model.requires_grad_(False)
-    model.eval()
-    return model
+    backbone = LyapunovDiT(cfg)
+    init_from_pixart_sigma(backbone, ckpt, strict_shapes=True, verbose=verbose)
+    return _finalize(backbone, fixed_t, device, dtype)
 
 
-__all__ = ["make_pixart_baseline", "pixart_sigma_baseline_config"]
+def make_pixart_baseline_diffusers(
+        ckpt: CkptLike,
+        *,
+        fixed_t: int,
+        text_encoder: TextEncoderName = "t5-v1_1-xxl",
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        verbose: bool = False,
+) -> EpsTweedieDenoiser:
+    """Same as `make_pixart_baseline`, but for diffusers-format checkpoints.
+
+    Accepts the `transformer/` subfolder of a downloaded diffusers
+    `PixArt-alpha/PixArt-Sigma-XL-2-*-MS` repo (which contains
+    `diffusion_pytorch_model.safetensors`), the safetensors file directly,
+    or an already-loaded mapping with the diffusers key layout.
+
+    Note: the diffusers transformer state dict does NOT contain
+    `caption_projection.y_embedding`, so `backbone.y_embedder.y_embedding`
+    remains at random init.  For CFG sampling, pass `null_kv = T5("")` via
+    `FrozenT5.null_kv(...)` instead of relying on the learnable null token.
+    """
+    cfg = pixart_sigma_baseline_config(fixed_t=fixed_t, text_encoder=text_encoder)
+    backbone = LyapunovDiT(cfg)
+    init_from_pixart_sigma_diffusers(backbone, ckpt, strict_shapes=True, verbose=verbose)
+    return _finalize(backbone, fixed_t, device, dtype)
+
+
+__all__ = [
+    "make_pixart_baseline",
+    "make_pixart_baseline_diffusers",
+    "pixart_sigma_baseline_config",
+]

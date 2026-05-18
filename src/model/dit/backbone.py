@@ -285,7 +285,7 @@ class LyapunovDiT(nn.Module):
 
         # -- text projection ---------------------------------------------------
         if self.use_cross_attn and text_kv is not None and self.y_embedder is not None:
-            y = self.y_embedder(text_kv.to(tokens.dtype))                      # [B, L, D]
+            y = self.y_embedder(text_kv.to(tokens.dtype), text_mask)           # [B, L, D]
         else:
             y = None
             text_mask = None

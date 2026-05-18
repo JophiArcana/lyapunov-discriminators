@@ -12,6 +12,70 @@ from model.dit.blocks import (
 )
 
 
+# -- CaptionEmbedder mask-based y_embedding substitution ---------------------
+
+
+def test_caption_embedder_mask_substitutes_y_embedding_row():
+    """When `mask[b, l]` is False, `forward` should replace `y_proj(caption)[b, l]`
+    with `y_proj(y_embedding)[l]`.  Verifies that the learnable null token
+    actually participates in the forward (was inert in v1).
+    """
+    torch.manual_seed(0)
+    in_channels, hidden, L = 16, 32, 6
+    emb = CaptionEmbedder(in_channels, hidden, null_token_count=L)
+
+    caption = torch.randn(2, L, in_channels)
+    expected_y_proj = emb.y_proj(caption)
+    expected_y_null = emb.y_proj(emb.y_embedding)
+
+    # All-True mask: identical to plain forward.
+    mask_all_true = torch.ones(2, L, dtype=torch.bool)
+    y_kept = emb(caption, mask_all_true)
+    assert torch.allclose(y_kept, expected_y_proj)
+
+    # All-False mask: every position is the null row.
+    mask_all_false = torch.zeros(2, L, dtype=torch.bool)
+    y_nulled = emb(caption, mask_all_false)
+    for b in range(2):
+        for l in range(L):
+            assert torch.allclose(y_nulled[b, l], expected_y_null[l])
+
+    # Mixed mask: per-token substitution.
+    mask_mixed = torch.tensor([
+        [True,  False, True, False, True, True],
+        [False, True,  True, True,  False, False],
+    ])
+    y_mixed = emb(caption, mask_mixed)
+    for b in range(2):
+        for l in range(L):
+            ref = expected_y_proj[b, l] if mask_mixed[b, l] else expected_y_null[l]
+            assert torch.allclose(y_mixed[b, l], ref)
+
+
+def test_caption_embedder_mask_ignored_when_shapes_mismatch():
+    """When `null_token_count != L`, the mask is silently ignored and only
+    `y_proj(caption)` is returned.  This preserves PixArt-parity for legacy
+    configs where the null sequence has a different length than the caption.
+    """
+    in_channels, hidden, L_caption, L_null = 16, 32, 6, 4
+    emb = CaptionEmbedder(in_channels, hidden, null_token_count=L_null)
+    caption = torch.randn(2, L_caption, in_channels)
+    mask = torch.zeros(2, L_caption, dtype=torch.bool)
+    y = emb(caption, mask)
+    assert torch.allclose(y, emb.y_proj(caption))
+
+
+def test_caption_embedder_null_kv_helper():
+    """`null_kv` returns the unprojected `y_embedding`, batch-expanded."""
+    in_channels, hidden, L = 16, 32, 6
+    emb = CaptionEmbedder(in_channels, hidden, null_token_count=L)
+    kv = emb.null_kv(batch_size=3)
+    assert kv.shape == (3, L, in_channels)
+    assert torch.equal(kv[0], emb.y_embedding)
+    assert torch.equal(kv[1], emb.y_embedding)
+    assert torch.equal(kv[2], emb.y_embedding)
+
+
 @pytest.fixture
 def small_dims():
     # Heads = 4, head_dim = 6 (divisible by 2 for plain attn; divisible by 6 for RoPE).

@@ -1,15 +1,17 @@
 {
-    "python.defaultInterpreterPath": "/home/wentinn/miniconda3/envs/lyapunov/bin/python",
-    "python.condaPath": "/home/wentinn/miniconda3/bin/conda",
-    "python.terminal.activateEnvironment": true,
-    "terminal.integrated.defaultProfile.linux": "bash",
-    "terminal.integrated.profiles.linux": {
-        "bash": {
-            "path": "bash",
-            "args": ["-l"]
-        }
-    },
-    "terminal.integrated.env.linux": {
-        "CONDA_DEFAULT_ENV": "lyapunov"
+  "python.defaultInterpreterPath": "/vast/projects/kostas/geometric-learning/wenliao/conda_envs/lyapunov/bin/python",
+  "python.condaPath": "/vast/parcc/spack/sw/apps/linux-zen4/miniconda3-25.5.1-dypgjukzsoebnoyhfrbijohg2uizpmyx/bin/conda",
+  "python.terminal.activateEnvironment": false,
+  "terminal.integrated.defaultProfile.linux": "bash (lyapunov)",
+  "terminal.integrated.profiles.linux": {
+    "bash (lyapunov)": {
+      "path": "bash",
+      "args": [
+        "--noprofile",
+        "--rcfile",
+        "${workspaceFolder}/.vscode/lyapunov-bashrc.sh",
+        "-i"
+      ]
     }
+  }
 }

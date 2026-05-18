@@ -91,7 +91,7 @@ class FrozenT5(nn.Module):
             *,
             device: Optional[torch.device] = None,
             dtype: torch.dtype = torch.bfloat16,
-            max_len: int = 256,
+            max_len: int = 300,
     ) -> None:
         super().__init__()
         if dtype == torch.float16:
@@ -165,6 +165,30 @@ class FrozenT5(nn.Module):
         the batch when `drop_text` chooses to suppress conditioning.
         """
         return self.encode([""], device=device)
+
+    @torch.no_grad()
+    def null_kv(
+            self,
+            *,
+            batch_size: int = 1,
+            device: Optional[torch.device] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convenience: T5 encoding of `""`, broadcast to `batch_size`.
+
+        Equivalent to calling `null_embedding(...)` and unpacking, then
+        expanding to the requested batch size.  Returns `(kv, mask)` ready
+        to pass directly to `sample(..., null_kv=kv, null_mask=mask)` or
+        `drop_text(..., null_kv=kv, null_mask=mask)`.
+
+        This is the canonical "null" sequence to use for CFG when the
+        backbone's learnable `y_embedding` is unavailable (e.g. when
+        initializing from the diffusers PixArt-Sigma checkpoint, which
+        does not ship `y_embedding`).
+        """
+        enc = self.encode([""], device=device)
+        kv   = enc.tokens.expand(batch_size, -1, -1)
+        mask = enc.mask.expand(batch_size, -1)
+        return kv, mask
 
 
 __all__ = ["FrozenT5", "EncodedText", "hf_id_for"]

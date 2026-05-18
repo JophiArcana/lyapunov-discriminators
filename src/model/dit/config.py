@@ -6,9 +6,10 @@ modulation flavor, the EDM noise schedule, and the few training-side knobs
 (`p_uncond`, `text_max_len`).
 
 The defaults below describe the *first concrete reference target* of the
-project: PixArt-Sigma-XL/2 paired with `t5-v1_1-xxl` and SD-VAE.  Other
-references (Wan2.x with umT5 + Wan-VAE, scratch builds, etc.) are reachable
-by overriding fields -- nothing is hard-wired downstream.
+project: PixArt-Sigma-XL/2 paired with `t5-v1_1-xxl` and SDXL-VAE (which is
+the VAE PixArt-Sigma bundles, scale factor 0.13025).  Other references
+(Wan2.x with umT5 + Wan-VAE, scratch builds with SDv1-VAE, etc.) are
+reachable by overriding fields -- nothing is hard-wired downstream.
 
 Why a dataclass and not a yaml/dict?  Two reasons:
 
@@ -161,7 +162,7 @@ class LyapunovDiTConfig:
     # -- text conditioning ---------------------------------------------------
     text_encoder: TextEncoderName = "t5-v1_1-xxl"
     text_dim: int = 4096                   # T5-XXL hidden; auto-aligned by the wrapper
-    text_max_len: int = 256
+    text_max_len: int = 300
     cross_attn_per_block: bool = True
     null_kind: NullKind = "learnable"
     null_token_count: int = 120            # only used when null_kind == "learnable"

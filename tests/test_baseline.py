@@ -24,7 +24,7 @@ from .test_init_from_pixart import _pixart_like_state_dict
 
 
 def test_baseline_config_has_expected_fields():
-    cfg = pixart_sigma_baseline_config(fixed_t=500.0)
+    cfg = pixart_sigma_baseline_config(fixed_t=500)
     assert cfg.hidden_size == 1152
     assert cfg.depth == 28
     assert cfg.num_heads == 16
@@ -36,10 +36,12 @@ def test_baseline_config_has_expected_fields():
     assert cfg.fixed_t_value == 500.0
     assert cfg.out_multiplier == 2
     assert cfg.pos_embed == "absolute_2d"
+    # PixArt-Sigma diffusers pipeline default for max_sequence_length.
+    assert cfg.text_max_len == 300
 
 
 def test_baseline_config_propagates_text_encoder_choice():
-    cfg = pixart_sigma_baseline_config(fixed_t=0.0, text_encoder="flan-t5-xxl")
+    cfg = pixart_sigma_baseline_config(fixed_t=0, text_encoder="flan-t5-xxl")
     assert cfg.text_encoder == "flan-t5-xxl"
     # Hidden size is unchanged -- text_encoder is a routing tag, not a shape.
     assert cfg.text_dim == 4096

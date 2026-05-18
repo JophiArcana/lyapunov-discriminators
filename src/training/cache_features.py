@@ -170,7 +170,7 @@ def cache_text_features(
         text_encoder_name: str = "t5-v1_1-xxl",
         device: str = "cuda",
         batch_size: int = 4,
-        max_len: int = 256,
+        max_len: int = 300,
 ) -> None:
     """Run captions through the frozen T5 encoder, store padded `[N, L, D]` features.
 
